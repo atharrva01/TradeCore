@@ -1,0 +1,10 @@
+.git
+node_modules
+dist
+internal/web/dist/*
+!internal/web/dist/.gitkeep
+playwright-report
+test-results
+load/results
+*.md
+*:Zone.Identifier

@@ -1,0 +1,21 @@
+# Render Blueprint: one free web service running the Docker image, which
+# serves the UI, API and WebSocket. Postgres lives on Neon (see docs/DEPLOY.md).
+services:
+  - type: web
+    name: tradecore
+    runtime: docker
+    plan: free
+    region: singapore
+    healthCheckPath: /api/v1/health
+    autoDeploy: true
+    envVars:
+      - key: DATABASE_URL
+        sync: false # Neon pooled connection string
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ADMIN_EMAILS
+        sync: false
+      - key: APP_ENV
+        value: production
+      - key: TRUST_PROXY
+        value: "true"

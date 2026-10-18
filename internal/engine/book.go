@@ -29,21 +29,36 @@ const (
 	PartiallyFilled Status = "PARTIALLY_FILLED"
 	Filled          Status = "FILLED"
 	Cancelled       Status = "CANCELLED"
+	// Rejected is assigned by the exchange, never by the book: an order that
+	// was accepted for matching but could not execute at all.
+	Rejected Status = "REJECTED"
+)
+
+type TimeInForce string
+
+const (
+	// GTC (good till cancelled) rests any unfilled limit quantity. It is the default.
+	GTC TimeInForce = "GTC"
+	// IOC (immediate or cancel) cancels whatever does not fill on arrival.
+	IOC TimeInForce = "IOC"
 )
 
 type Order struct {
-	ID        string    `json:"id"`
-	UserID    string    `json:"userId"`
-	Symbol    string    `json:"symbol"`
-	Side      Side      `json:"side"`
-	Type      OrderType `json:"type"`
-	Price     int64     `json:"price"`
-	Quantity  int64     `json:"quantity"`
-	FilledQty int64     `json:"filledQty"`
-	Status    Status    `json:"status"`
-	CreatedAt int64     `json:"createdAt"`
+	ID        string      `json:"id"`
+	UserID    string      `json:"userId"`
+	Symbol    string      `json:"symbol"`
+	Side      Side        `json:"side"`
+	Type      OrderType   `json:"type"`
+	TIF       TimeInForce `json:"timeInForce,omitempty"`
+	Price     int64       `json:"price"`
+	Quantity  int64       `json:"quantity"`
+	FilledQty int64       `json:"filledQty"`
+	Status    Status      `json:"status"`
+	CreatedAt int64       `json:"createdAt"`
 	// Budget caps the cash a market buy may spend; it is required for market buys.
 	Budget int64 `json:"-"`
+	// Seq is the exchange-wide arrival sequence, used to restore time priority.
+	Seq uint64 `json:"-"`
 }
 
 type Trade struct {
@@ -118,6 +133,12 @@ func (b *Book) Place(in Order, now int64, nextTradeID func() string) (Result, er
 	if in.Type != Limit && in.Type != Market {
 		return Result{}, errors.New("invalid order type")
 	}
+	if in.TIF == "" {
+		in.TIF = GTC
+	}
+	if in.TIF != GTC && in.TIF != IOC {
+		return Result{}, errors.New("invalid time in force")
+	}
 	if in.Type == Limit && in.Price <= 0 {
 		return Result{}, errors.New("invalid limit price")
 	}
@@ -185,8 +206,8 @@ func (b *Book) Place(in Order, now int64, nextTradeID func() string) (Result, er
 	switch {
 	case in.FilledQty == in.Quantity:
 		in.Status = Filled
-	case in.Type == Market:
-		// A market order never rests, so any unfilled remainder is cancelled.
+	case in.Type == Market || in.TIF == IOC:
+		// Market and IOC orders never rest, so any unfilled remainder is cancelled.
 		in.Status = Cancelled
 	case in.FilledQty > 0:
 		in.Status = PartiallyFilled
@@ -197,6 +218,30 @@ func (b *Book) Place(in Order, now int64, nextTradeID func() string) (Result, er
 	}
 	result.Order = in
 	return result, nil
+}
+
+// Restore puts a previously accepted resting order back on the book without
+// matching it. Orders must be restored in their original arrival order so
+// that time priority at each price is preserved.
+func (b *Book) Restore(order Order) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if order.Symbol != b.symbol || order.Type != Limit || order.Price <= 0 ||
+		order.FilledQty < 0 || order.FilledQty >= order.Quantity ||
+		(order.Status != Open && order.Status != PartiallyFilled) {
+		return errors.New("only open limit orders can be restored")
+	}
+	if order.Side != Buy && order.Side != Sell {
+		return errors.New("invalid side")
+	}
+	if _, exists := b.orders[order.ID]; exists {
+		return errors.New("duplicate order ID")
+	}
+	if best, ok := b.bestOpposite(order.Side); ok && crosses(order.Side, order.Price, best) {
+		return errors.New("restored order would cross the book")
+	}
+	b.add(&order)
+	return nil
 }
 
 func (b *Book) Cancel(id string, userID string) (Order, error) {

@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/mail"
@@ -40,27 +41,90 @@ func (s *server) issueAccessToken(userID string, accountExpiry time.Time) (strin
 	return token.SignedString(s.jwtSecret)
 }
 
-func (s *server) createSession(w http.ResponseWriter, userID string, user *account, status int) {
+// respondWithSession issues a new access and refresh token for the user,
+// commits the session together with any other pending changes, and only then
+// answers. The caller must hold s.mu; it is released before returning.
+func (s *server) respondWithSession(w http.ResponseWriter, userID string, user *account, status int) {
 	accessToken, err := s.issueAccessToken(userID, user.ExpiresAt)
 	if err != nil {
+		s.mu.Unlock()
 		writeError(w, http.StatusInternalServerError, "TOKEN_ERROR", "Could not create session")
 		return
 	}
+	refreshToken, expiresAt := s.startRefreshSession(user)
+	if !s.durable(w) {
+		return
+	}
+	s.setRefreshCookie(w, refreshToken, expiresAt)
+	writeJSON(w, status, map[string]any{
+		"accessToken": accessToken,
+		"user": map[string]any{
+			"id": userID, "name": user.Name, "isGuest": user.isGuest(), "isAdmin": user.IsAdmin,
+		},
+	})
+}
+
+// startRefreshSession registers a new refresh token for the user. The caller
+// must hold s.mu and commit before handing the token out.
+func (s *server) startRefreshSession(user *account) (string, time.Time) {
 	refreshToken, err := randomToken()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "TOKEN_ERROR", "Could not create session")
-		return
+		panic(err) // crypto/rand does not fail on supported platforms
 	}
 	expiresAt := time.Now().Add(refreshTokenTTL)
 	if !user.ExpiresAt.IsZero() && user.ExpiresAt.Before(expiresAt) {
 		expiresAt = user.ExpiresAt
 	}
-	s.refreshTokens[hashToken(refreshToken)] = refreshRecord{UserID: userID, ExpiresAt: expiresAt}
-	s.setRefreshCookie(w, refreshToken, expiresAt)
-	writeJSON(w, status, map[string]any{
-		"accessToken": accessToken,
-		"user":        map[string]string{"id": userID, "name": user.Name},
+	tokenHash := hashToken(refreshToken)
+	s.refreshTokens[tokenHash] = refreshRecord{UserID: user.ID, ExpiresAt: expiresAt}
+	s.markToken(tokenHash)
+	return refreshToken, expiresAt
+}
+
+func (s *server) subjectFromToken(r *http.Request) (string, error) {
+	raw, found := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if !found {
+		return "", errors.New("missing bearer token")
+	}
+	return s.subjectFromRaw(raw)
+}
+
+func (s *server) subjectFromRaw(raw string) (string, error) {
+	if raw == "" {
+		return "", errors.New("missing token")
+	}
+	claims := &accessClaims{}
+	token, err := jwt.ParseWithClaims(raw, claims, func(token *jwt.Token) (any, error) {
+		if token.Method != jwt.SigningMethodHS256 {
+			return nil, fmt.Errorf("unexpected signing method %s", token.Method.Alg())
+		}
+		return s.jwtSecret, nil
 	})
+	if err != nil || !token.Valid {
+		return "", errors.New("invalid token")
+	}
+	return claims.Subject, nil
+}
+
+// accountActive reports whether the account exists and has not expired.
+func (s *server) accountActive(userID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	user := s.accounts[userID]
+	return user != nil && (user.ExpiresAt.IsZero() || time.Now().Before(user.ExpiresAt))
+}
+
+func (s *server) authenticatedUser(w http.ResponseWriter, r *http.Request) (string, bool) {
+	userID, err := s.subjectFromToken(r)
+	if err != nil || !s.accountActive(userID) {
+		writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "Session is no longer valid")
+		return "", false
+	}
+	return userID, true
+}
+
+func (s *server) allowAuthAttempt(r *http.Request) bool {
+	return s.limits.authPerIP.allow(s.clientIP(r), time.Now())
 }
 
 func (s *server) signup(w http.ResponseWriter, r *http.Request) {
@@ -92,10 +156,7 @@ func (s *server) signup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "INVALID_NAME", "Display name must be between 1 and 32 characters")
 		return
 	}
-	s.mu.Lock()
-	allowed := s.allowAuthAttempt(r, time.Now())
-	s.mu.Unlock()
-	if !allowed {
+	if !s.allowAuthAttempt(r) {
 		writeError(w, http.StatusTooManyRequests, "RATE_LIMITED", "Too many attempts; try again in a minute")
 		return
 	}
@@ -105,21 +166,20 @@ func (s *server) signup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	userID := s.nextID("user-")
-	user := &account{
-		Name: name, Email: email, PasswordHash: string(passwordHash),
-		Cash: balance{Available: startingCash}, Shares: make(map[string]balance),
-		Positions: make(map[string]*position),
-	}
+	user := newAccount(userID, name)
+	user.Email, user.PasswordHash, user.Cash = email, string(passwordHash), balance{Available: startingCash}
+	user.IsAdmin = s.adminEmails[email]
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	for _, existing := range s.accounts {
 		if existing.Email == email {
+			s.mu.Unlock()
 			writeError(w, http.StatusConflict, "EMAIL_TAKEN", "An account with this email already exists")
 			return
 		}
 	}
 	s.accounts[userID] = user
-	s.createSession(w, userID, user, http.StatusCreated)
+	s.markAccount(userID)
+	s.respondWithSession(w, userID, user, http.StatusCreated)
 }
 
 func (s *server) login(w http.ResponseWriter, r *http.Request) {
@@ -136,16 +196,15 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	email := strings.ToLower(strings.TrimSpace(input.Email))
-	s.mu.Lock()
-	if !s.allowAuthAttempt(r, time.Now()) {
-		s.mu.Unlock()
+	if !s.allowAuthAttempt(r) {
 		writeError(w, http.StatusTooManyRequests, "RATE_LIMITED", "Too many attempts; try again in a minute")
 		return
 	}
+	s.mu.Lock()
 	var userID string
 	passwordHash := dummyHash
 	for id, candidate := range s.accounts {
-		if email != "" && candidate.Email == email {
+		if email != "" && candidate.Email == email && candidate.PasswordHash != "" {
 			userID, passwordHash = id, []byte(candidate.PasswordHash)
 			break
 		}
@@ -155,13 +214,17 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 	// bcrypt takes ~250 ms at cost 12, so it must run outside the exchange lock.
 	passwordOK := bcrypt.CompareHashAndPassword(passwordHash, []byte(input.Password)) == nil
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	user := s.accounts[userID]
 	if userID == "" || !passwordOK || user == nil {
+		s.mu.Unlock()
 		writeError(w, http.StatusUnauthorized, "INVALID_CREDENTIALS", "Email or password is incorrect")
 		return
 	}
-	s.createSession(w, userID, user, http.StatusOK)
+	if isAdmin := s.adminEmails[user.Email]; isAdmin != user.IsAdmin {
+		user.IsAdmin = isAdmin
+		s.markAccount(userID)
+	}
+	s.respondWithSession(w, userID, user, http.StatusOK)
 }
 
 func (s *server) refresh(w http.ResponseWriter, r *http.Request) {
@@ -175,19 +238,24 @@ func (s *server) refresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	tokenHash := hashToken(cookie.Value)
 	record, exists := s.refreshTokens[tokenHash]
 	user := s.accounts[record.UserID]
+	if exists {
+		// Refresh tokens are single-use: rotate on every refresh.
+		delete(s.refreshTokens, tokenHash)
+		s.markToken(tokenHash)
+	}
 	if !exists || user == nil || time.Now().After(record.ExpiresAt) ||
 		(!user.ExpiresAt.IsZero() && time.Now().After(user.ExpiresAt)) {
-		delete(s.refreshTokens, tokenHash)
+		if !s.durable(w) {
+			return
+		}
 		s.clearRefreshCookie(w)
 		writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "Refresh session is no longer valid")
 		return
 	}
-	delete(s.refreshTokens, tokenHash)
-	s.createSession(w, record.UserID, user, http.StatusOK)
+	s.respondWithSession(w, record.UserID, user, http.StatusOK)
 }
 
 func (s *server) logout(w http.ResponseWriter, r *http.Request) {
@@ -199,9 +267,15 @@ func (s *server) logout(w http.ResponseWriter, r *http.Request) {
 	// short-lived access token has expired.
 	s.mu.Lock()
 	if cookie, err := r.Cookie("tradecore_refresh"); err == nil {
-		delete(s.refreshTokens, hashToken(cookie.Value))
+		tokenHash := hashToken(cookie.Value)
+		if _, exists := s.refreshTokens[tokenHash]; exists {
+			delete(s.refreshTokens, tokenHash)
+			s.markToken(tokenHash)
+		}
 	}
-	s.mu.Unlock()
+	if !s.durable(w) {
+		return
+	}
 	s.clearRefreshCookie(w)
 	w.WriteHeader(http.StatusNoContent)
 }

@@ -2,3 +2,8 @@ node_modules/
 dist/
 *.tsbuildinfo
 *:Zone.Identifier
+internal/web/dist/*
+!internal/web/dist/.gitkeep
+playwright-report/
+test-results/
+load/results/

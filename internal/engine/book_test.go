@@ -157,7 +157,7 @@ func TestRandomOrdersKeepBookInvariants(t *testing.T) {
 			id := live[j]
 			live = append(live[:j], live[j+1:]...)
 			if loc, ok := book.orders[id]; ok {
-				book.Cancel(id, loc.elem.Value.(*Order).UserID)
+				_, _ = book.Cancel(id, loc.elem.Value.(*Order).UserID)
 			}
 			continue
 		}
@@ -191,5 +191,30 @@ func TestRandomOrdersKeepBookInvariants(t *testing.T) {
 		if hasBid && hasAsk && bid >= ask {
 			t.Fatalf("book crossed after order %d: bid %d >= ask %d", i, bid, ask)
 		}
+	}
+}
+
+func TestRestoreKeepsTimePriorityAndRejectsCrossing(t *testing.T) {
+	book := NewBook("TEST")
+	first := order("first", "u1", Sell, Limit, 100, 5)
+	first.Status = Open
+	second := order("second", "u2", Sell, Limit, 100, 5)
+	second.Status, second.FilledQty = PartiallyFilled, 2
+	for _, resting := range []Order{first, second} {
+		if err := book.Restore(resting); err != nil {
+			t.Fatal(err)
+		}
+	}
+	crossing := order("crossing", "u3", Buy, Limit, 100, 1)
+	crossing.Status = Open
+	if err := book.Restore(crossing); err == nil {
+		t.Fatal("restoring a crossing order should fail")
+	}
+	result, err := book.Place(order("buy", "u3", Buy, Limit, 100, 8), 1, tradeIDFactory())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Fills) != 2 || result.Fills[0].Trade.SellOrder != "first" || result.Fills[1].Trade.Quantity != 3 {
+		t.Fatalf("fills after restore = %+v; want first then the restored remainder of second", result.Fills)
 	}
 }
