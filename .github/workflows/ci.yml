@@ -25,9 +25,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - uses: golangci/golangci-lint-action@v6
+      - uses: golangci/golangci-lint-action@v8
         with:
-          version: latest
+          version: v2.14.0
       - run: go vet ./...
       - name: Unit, invariant and Postgres integration tests
         run: go test -race -count=1 ./...
